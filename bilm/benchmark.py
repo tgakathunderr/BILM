@@ -132,9 +132,9 @@ def benchmark_forgetting() -> None:
     degradation = ((acc_after - acc_before) / max(acc_before, 1e-9)) * 100
     print(f"\n  Accuracy Change: {degradation:+.1f}%")
     if degradation > -10:
-        print("  ✅ PASS: Catastrophic forgetting prevented (<10% degradation)")
+        print("  [PASS] Catastrophic forgetting prevented (<10% degradation)")
     else:
-        print("  ⚠️  Degradation present. Interference occurred.")
+        print("  [WARN] Degradation present. Interference occurred.")
 
 
 # ---------------------------------------------------------------------------
