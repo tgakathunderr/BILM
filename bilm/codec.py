@@ -1,16 +1,3 @@
-"""
-BILM — codec.py
-Byte ↔ SDR codec with per-symbol frequency tracking and tag parsing.
-
-Sources:
-  BIM 3 core/codec.py: ByteCodec class, deterministic SDR map, decode logic
-  BIM 4 thalamus.py:   Control tag parsing at the sensory layer
-
-Tags intercepted before the cortex:
-  [SLEEP]       → trigger offline consolidation
-  [CHECKPOINT]  → save weights to disk
-  [RESET]       → reset cortical context (but not weights)
-"""
 from __future__ import annotations
 
 import re

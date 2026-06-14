@@ -1,12 +1,3 @@
-"""
-BILM — homeostasis.py
-Synaptic rescaling and pruning to prevent saturation.
-
-Ported from BIM 3 learning/homeostasis.py.
-Fires every HOMEOSTASIS_EVERY_N tokens. Two operations:
-  1. Rescale: cells whose permanence sum exceeds target are scaled down.
-  2. Prune:   synapses below SYNAPSE_PRUNE_THRESHOLD are deleted entirely.
-"""
 from __future__ import annotations
 
 import numpy as np

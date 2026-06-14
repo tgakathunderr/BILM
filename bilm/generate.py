@@ -1,11 +1,3 @@
-"""
-BILM — generate.py
-Text generation interface.
-
-Run:
-    py -m bilm.generate --prompt "The quick brown" --checkpoint checkpoints/bilm.npz
-    py -m bilm.generate --prompt "The quick brown" --temperature 0.9 --max-chars 400
-"""
 from __future__ import annotations
 
 import argparse

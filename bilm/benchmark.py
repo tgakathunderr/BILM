@@ -1,17 +1,3 @@
-"""
-BILM — benchmark.py
-Three automated benchmarks proving BILM's architectural claims.
-
-Benchmark A — Perplexity / BPC on WikiText-2 (standard LM comparison)
-Benchmark B — Catastrophic Forgetting (BILM's headline win)
-Benchmark C — Efficiency (RAM, TPS)
-
-Run:
-    py -m bilm.benchmark --test all
-    py -m bilm.benchmark --test perplexity --train-tokens 500000
-    py -m bilm.benchmark --test forgetting
-    py -m bilm.benchmark --test efficiency
-"""
 from __future__ import annotations
 
 import argparse

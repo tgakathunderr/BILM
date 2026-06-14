@@ -1,12 +1,3 @@
-"""
-BILM — Biologically Inspired Language Model
-config.py: All hyperparameters in one place.
-
-Sources:
-  BIM 1: SDR geometry (16384 × 64)
-  BIM 3: Cortex, homeostasis, hippocampus, synapse thresholds
-  BIM 4: Variance-based ACh habituation window
-"""
 from __future__ import annotations
 import os
 

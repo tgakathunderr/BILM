@@ -1,15 +1,3 @@
-"""
-BILM — generator.py
-Decode the Cortex's predicted SDR columns back into a byte or text.
-
-This is purely a decoder — no learned parameters, no gradient.
-The Cortex already computed the prediction. The Generator just reads it.
-
-Two modes:
-  - argmax:    return the single most-likely byte
-  - sample:    temperature-scaled sampling from top-K candidates
-               with repetition penalty on last 3 bytes
-"""
 from __future__ import annotations
 
 import math

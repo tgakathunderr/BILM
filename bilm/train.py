@@ -1,11 +1,3 @@
-"""
-BILM — train.py
-Streaming training loop with checkpointing, BPC reporting, and sleep triggers.
-
-Run:
-    py -m bilm.train --text data/wiki.txt
-    py -m bilm.train --text data/wiki.txt --resume checkpoints/bilm.npz
-"""
 from __future__ import annotations
 
 import argparse

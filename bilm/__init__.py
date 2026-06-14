@@ -1,4 +1,3 @@
-"""BILM package init."""
 from bilm.model import BILM
 
 __all__ = ["BILM"]

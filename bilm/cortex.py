@@ -1,13 +1,3 @@
-"""
-BILM — cortex.py
-Hierarchical sparse predictive cortex. 3 layers with bidirectional apical flow.
-
-Ported from BIM 3 core/cortex.py with both bugs fixed:
-  - APICAL_BIAS_THRESHOLD = 0.05 (was 0.50 — made top-down path permanently silent)
-  - Winner-cell selection direction fixed in kernels.py (incoming, not outgoing)
-
-BIM 2 optimization: skip Hebbian kernel when surprise == 0.0 (perfect prediction).
-"""
 from __future__ import annotations
 
 import numpy as np

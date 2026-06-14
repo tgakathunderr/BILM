@@ -1,16 +1,3 @@
-"""
-BILM — neuromod.py
-Acetylcholine neuromodulator: surprise + symbol habituation → learning rate.
-
-Sources:
-  BIM 3 core/neuromod.py:  Rolling-mean surprise, per-symbol log habituation
-  BIM 4 brainstem.py:      Variance-based habituation (prevents ACh saturation
-                            on predictable-but-repetitive patterns like spaces)
-
-The BIM 4 addition is critical for BILM: without variance checking, training on
-English text saturates ACh permanently on common function words ("the", "is", "of"),
-which drives max learning rate on every token and destabilizes the cortex.
-"""
 from __future__ import annotations
 
 from collections import deque

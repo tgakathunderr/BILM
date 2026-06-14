@@ -1,12 +1,3 @@
-"""
-BILM — hippocampus.py
-CA3 sparse attractor network for episodic memory and long-context retrieval.
-
-Ported from BIM 3 core/hippocampus.py.
-Binds high-surprise cortical states into Hopfield-style attractor weights.
-Retrieves via iterative dynamics (pattern completion from partial cues).
-BILM-specific: applies retrieved attractor as apical bias on L1 for long-range context.
-"""
 from __future__ import annotations
 
 import numpy as np

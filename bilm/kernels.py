@@ -1,11 +1,3 @@
-"""
-BILM — kernels.py
-Numba JIT-compiled Hebbian plasticity kernels.
-
-Ported from BIM 3 learning/kernels.py with the two direction bugs already fixed:
-  - select_winner_cell_jit: uses INCOMING synapses from prev_winners (not outgoing)
-  - apply_predictive_rules_jit: correct Hebbian + LTD sequence
-"""
 from __future__ import annotations
 
 import numpy as np

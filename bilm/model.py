@@ -1,18 +1,3 @@
-"""
-BILM — model.py
-The unified BILM class. Wires all organs together.
-
-Architecture based on BIM 4 species.py tick() design:
-  one clean ordered pipeline per token, each organ has one job.
-
-Organs:
-  Codec        → byte to SDR (BIM 3 + BIM 4 tags)
-  Cortex       → hierarchical predictive sequence memory (BIM 3)
-  Neuromod     → ACh learning rate gating (BIM 3 + BIM 4)
-  Homeostasis  → synaptic rescale + prune (BIM 3)
-  Hippocampus  → long-context episodic attractor memory (BIM 3)
-  Generator    → SDR prediction → next byte (NEW)
-"""
 from __future__ import annotations
 
 import os
