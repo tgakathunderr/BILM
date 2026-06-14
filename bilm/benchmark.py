@@ -36,15 +36,15 @@ def _load_text(path: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# BPC computation
+# Evaluation metric
 # ---------------------------------------------------------------------------
 
-def eval_bpc(model: BILM, data: bytes, label: str = "") -> float:
-    """Evaluate bits-per-character on held-out data (no learning)."""
+def eval_accuracy(model: BILM, data: bytes, label: str = "") -> float:
+    """Evaluate next-byte prediction accuracy on held-out data (no learning)."""
     correct = 0
     total = len(data)
     if total == 0:
-        return float("inf")
+        return 0.0
 
     for b in data:
         pred = model.tick(int(b), learn=False)
@@ -52,20 +52,17 @@ def eval_bpc(model: BILM, data: bytes, label: str = "") -> float:
             correct += 1
 
     accuracy = correct / total
-    # BPC from accuracy: -log2(accuracy) (approximate)
-    accuracy = max(1e-9, accuracy)
-    bpc = -math.log2(accuracy)
     if label:
-        print(f"  {label}: accuracy={accuracy:.4f}  BPC~{bpc:.4f}")
-    return bpc
+        print(f"  {label}: accuracy={accuracy:.4f}")
+    return accuracy
 
 
 # ---------------------------------------------------------------------------
-# Benchmark A: Perplexity / BPC
+# Benchmark A: Accuracy
 # ---------------------------------------------------------------------------
 
-def benchmark_perplexity(train_tokens: int = 500_000) -> None:
-    print("\n=== Benchmark A: WikiText-2 BPC ===")
+def benchmark_accuracy(train_tokens: int = 500_000) -> None:
+    print("\n=== Benchmark A: WikiText-2 Next-Byte Accuracy ===")
 
     train_path = os.path.join(DATA_DIR, "wikitext2_train.txt")
     test_path  = os.path.join(DATA_DIR, "wikitext2_test.txt")
@@ -88,69 +85,33 @@ def benchmark_perplexity(train_tokens: int = 500_000) -> None:
     print(f"  Training done in {elapsed:.1f}s  ({tps:.0f} TPS)")
 
     model.cortex.reset_context()
-    bpc = eval_bpc(model, test_data, label="WikiText-2 Test")
-    print(f"\n  Result: BPC = {bpc:.4f}")
-    print("  (LSTM large baseline: ~1.30 BPC on WikiText-2 char-level)")
+    acc = eval_accuracy(model, test_data, label="WikiText-2 Test")
+    print(f"\n  Result: Next-Byte Accuracy = {acc:.4f}")
+    print("  (Note: BILM utilizes sparse representations without softmax distributions,")
+    print("   making direct BPC comparisons to dense models invalid.)")
 
 
 # ---------------------------------------------------------------------------
 # Benchmark B: Catastrophic Forgetting
 # ---------------------------------------------------------------------------
 
-DOMAIN_A_TEXT = """
-The history of science is the study of the development of science and scientific knowledge.
-Science is a systematic enterprise that builds and organizes knowledge in the form of testable
-explanations and predictions about the universe. The earliest roots of science can be traced
-to ancient Egypt and Mesopotamia in around 3500 to 3000 BCE. Their contributions entered and
-shaped Greek natural philosophy of classical antiquity, whereby formal attempts were made to
-provide explanations of events in the physical world based on natural causes. After the fall
-of the Western Roman Empire, knowledge of Greek conceptions of the world deteriorated in Western
-Europe during the early centuries of the Middle Ages but was preserved in the Muslim world.
-""" * 50  # Repeat to get ~10K chars of domain A
-
-
-DOMAIN_B_TEXT = """
-def fibonacci(n):
-    if n <= 1:
-        return n
-    return fibonacci(n-1) + fibonacci(n-2)
-
-class BinaryTree:
-    def __init__(self, value):
-        self.value = value
-        self.left = None
-        self.right = None
-
-    def insert(self, val):
-        if val < self.value:
-            if self.left is None:
-                self.left = BinaryTree(val)
-            else:
-                self.left.insert(val)
-        else:
-            if self.right is None:
-                self.right = BinaryTree(val)
-            else:
-                self.right.insert(val)
-
-def quicksort(arr):
-    if len(arr) <= 1:
-        return arr
-    pivot = arr[len(arr) // 2]
-    left = [x for x in arr if x < pivot]
-    middle = [x for x in arr if x == pivot]
-    right = [x for x in arr if x > pivot]
-    return quicksort(left) + middle + quicksort(right)
-""" * 50  # Repeat to get ~10K chars of domain B
-
-
 def benchmark_forgetting() -> None:
     print("\n=== Benchmark B: Catastrophic Forgetting ===")
 
+    # Use real, non-repeating data for honest testing
+    train_path = os.path.join(DATA_DIR, "wikitext2_train.txt")
+    _download(WIKITEXT2_TRAIN_URL, train_path)
+    wiki_data = _load_text(train_path)
+
+    domain_a = wiki_data[:20000]
+    # Held-out evaluation set from Domain A (never seen during training)
+    eval_a   = wiki_data[20000:25000]
+
+    # Domain B: python code (use this file itself)
+    with open(__file__, "rb") as f:
+        domain_b = f.read()
+
     model = BILM()
-    domain_a = DOMAIN_A_TEXT.encode("utf-8")
-    domain_b = DOMAIN_B_TEXT.encode("utf-8")
-    eval_a   = DOMAIN_A_TEXT[:2000].encode("utf-8")
 
     # Train on Domain A
     print(f"  Training on Domain A (natural language, {len(domain_a):,} bytes) ...")
@@ -158,7 +119,7 @@ def benchmark_forgetting() -> None:
         model.tick(int(b), learn=True)
 
     model.cortex.reset_context()
-    bpc_before = eval_bpc(model, eval_a, "Domain A BPC BEFORE domain B training")
+    acc_before = eval_accuracy(model, eval_a, "Domain A accuracy BEFORE domain B training")
 
     # Train on Domain B
     print(f"  Training on Domain B (Python code, {len(domain_b):,} bytes) ...")
@@ -166,15 +127,14 @@ def benchmark_forgetting() -> None:
         model.tick(int(b), learn=True)
 
     model.cortex.reset_context()
-    bpc_after = eval_bpc(model, eval_a, "Domain A BPC AFTER domain B training")
+    acc_after = eval_accuracy(model, eval_a, "Domain A accuracy AFTER domain B training")
 
-    degradation = ((bpc_after - bpc_before) / max(bpc_before, 1e-9)) * 100
-    print(f"\n  Degradation: {degradation:+.1f}%")
-    if degradation < 10:
+    degradation = ((acc_after - acc_before) / max(acc_before, 1e-9)) * 100
+    print(f"\n  Accuracy Change: {degradation:+.1f}%")
+    if degradation > -10:
         print("  ✅ PASS: Catastrophic forgetting prevented (<10% degradation)")
     else:
-        print("  ⚠️  Degradation present. Sparsity may need tuning.")
-    print("  (Typical LSTM/Transformer degradation: 30–80%)")
+        print("  ⚠️  Degradation present. Interference occurred.")
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +158,18 @@ def benchmark_efficiency() -> None:
     current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
+    # NumPy C-allocations (like the 8192x8192 float32 Hippocampus W matrix) 
+    # are often missed by tracemalloc. Add manual estimate:
+    # 8192 * 8192 * 4 bytes = 268.4 MB
+    estimated_np_mb = 268.4
+    peak_mb = (peak / 1024 / 1024) + estimated_np_mb
+
     tps = len(sample) / max(elapsed, 1e-9)
-    peak_mb = peak / 1024 / 1024
 
     print(f"  Tokens processed: {len(sample):,}")
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Tokens per second: {tps:.0f} TPS")
-    print(f"  Peak RAM (traced): {peak_mb:.1f} MB")
-    print(f"  (GPT-2 small inference: ~500MB RAM, requires GPU)")
+    print(f"  Peak RAM (traced + numpy est): ~{peak_mb:.1f} MB")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +180,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="BILM benchmark suite")
     parser.add_argument(
         "--test",
-        choices=["perplexity", "forgetting", "efficiency", "all"],
+        choices=["accuracy", "forgetting", "efficiency", "all"],
         default="all",
     )
     parser.add_argument("--train-tokens", type=int, default=500_000)
@@ -225,8 +189,8 @@ def main() -> None:
     print("BILM Benchmark Suite")
     print("=" * 50)
 
-    if args.test in ("perplexity", "all"):
-        benchmark_perplexity(train_tokens=args.train_tokens)
+    if args.test in ("accuracy", "all"):
+        benchmark_accuracy(train_tokens=args.train_tokens)
 
     if args.test in ("forgetting", "all"):
         benchmark_forgetting()
