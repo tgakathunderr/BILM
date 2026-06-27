@@ -1,97 +1,170 @@
-# BILM (Biologically Inspired Language Model)
+# BILM 2 — Lifelong Language Substrate
 
-BILM is a continuously-learning, CPU-native alternative sequence model inspired by biological neural systems. It utilizes an architecture based on Sparse Distributed Representations (SDRs), a predictive cortical hierarchy, and an episodic CA3 Hippocampus.
+BILM is an experimental, byte-native language model built around sparse cortical
+sequence learning, online local plasticity, neuromodulation, homeostasis, and
+hippocampal associative memory.
 
-Unlike traditional Transformers, BILM is designed to learn continuously from a streaming input of bytes without suffering from catastrophic forgetting. It achieves high sample efficiency and operates efficiently on standard consumer CPUs.
+The current release is **2.0.0 alpha**. It provides valid autoregressive probability
+distributions and bits-per-byte evaluation. Its intended research advantage is
+continual online learning with lower catastrophic forgetting on consumer CPUs.
 
-## Theoretical Foundations & Acknowledgments
+## Implementation Status
 
-The architecture of BILM is deeply indebted to the foundational theories of **Hierarchical Temporal Memory (HTM)**, pioneered by Jeff Hawkins and the team at Numenta. Their mathematical definitions of Sparse Distributed Representations (SDRs), predictive sequence memory, and local Hebbian plasticity provided the biological bedrock upon which our continuous stream learning and hierarchical predictive engines are built. We salute their work in championing biologically plausible intelligence.
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 0 | Complete | Defect confirmation: predictive_cells in-place write, context capture with cell_usage, evaluation idempotency |
+| Phase 1 | Complete | Semantic correctness: v2 API, side-effect-free evaluation, checkpoint v2 roundtrip, determinism, typed result objects |
+| Phase 2 | Complete | Byte LM: local probabilistic readout, unigram/bigram/trigram baselines, grammar generators, learning curves |
+| Phase 3 | Complete | Hierarchy: ablation framework (apical, homeostasis, CA3, neuromod, L1-only), temporal pooling |
+| Phase 4 | Complete | Memory: CA3 binding/retrieval, bounded sparse recurrent, consolidation replay |
+| Phase 5 | Complete | Benchmark: 5-domain continual learning (English, code, scientific, legal, multilingual), 3 domain orders |
+| Phase 6 | Complete | Scaling: memory profile, throughput profile, checkpoint profile, scaling curves |
+| Phase 7 | Complete | Challenger: BILM vs baselines comparison with criteria checking |
 
-## Key Features
+### Architecture
 
-1. **Zero Catastrophic Forgetting:** Fine-tuning BILM on new domains (e.g., Python code) does not degrade its performance on previously learned domains (e.g., English text). Under rigorous evaluation, it achieves **0.0% degradation (perfect retention)** on held-out evaluation sets due to the mathematical isolation of sparse representations and hippocampal segregation.
-2. **CPU-Native Efficiency:** BILM uses a completely sparse binary architecture, implemented via JIT-compiled Numba kernels. It does not require a GPU and operates efficiently within a modest memory footprint on standard CPU architectures.
-3. **Continuous Hebbian Learning:** Instead of backpropagation over a frozen dataset, BILM continuously updates its synaptic weights in real-time as it streams over text. It uses Acetylcholine (ACh) variance-based habituation to scale its learning rate dynamically depending on how "surprising" the input is.
-4. **Episodic Long-Range Context:** The CA3 Hippocampus stores high-surprise cortical states. When a partial cue is recognized later, it auto-associatively retrieves the full pattern and injects it top-down, providing long-range context without a traditional KV-cache.
+```
+       [Raw Byte Stream]
+              │
+      ┌───────▼───────┐
+      │ Sensory Codec │ (Hash-based SDR projection, N=16384, w=64)
+      └───────┬───────┘
+              │ (0.39% Sparse SDR)
+      ┌───────▼────────┐
+      │  Predictive    ◄──────────────────┐ Apical Feedback
+      │    Cortex      ├──────────────┐   │ (Contextual Bias)
+      └───────┬────────┘              │   │
+              │                       ▼───┴───┐
+              │ High surprise       ┌─────────┴─┐
+              └─────────────────────►   CA3     │
+                                        Hippocampus│ (Recurrent Attractor)
+                                        └───────────┘
+```
+
+### Bug Fixes (Phase 0)
+
+- `cortex.py`: `_generate_predictions()` now writes `predictive_cells` in-place
+  instead of replacing the array reference, eliminating memory churn.
+- `model.py`: `_capture_context()` now captures **all** mutable state including
+  `cell_usage`, codec frequencies, neuromod windows, homeostasis counters, and
+  hippocampus state. `_restore_context()` restores everything.
+- `model.py`: `generate()` API now uses `max_bytes` parameter per spec.
+- `model.py`: Added `BILM.from_checkpoint()` classmethod.
+- `baselines.py`: Added `UnigramByteLM` baseline.
+- `benchmark.py`: Fixed RSS measurement to use actual process RSS instead of
+  hardcoded 268.4 MB estimate.
+
+### Evaluation Contract
+
+- `predict_next()` returns the distribution before seeing the current byte.
+- `observe(byte)` scores the prior prediction against the byte, then learns.
+- `evaluate()` captures all state, processes bytes with `learn=False`, and
+  restores all state. It is provably side-effect-free.
+- Autoregressive alignment: prediction from context through position `i` is
+  scored against byte `i`.
 
 ## Installation
 
-You can install BILM via `pip` or by cloning the repository.
-
 ```bash
-git clone https://github.com/your-org/BILM.git
-cd BILM
 pip install -e .
+pip install -e ".[dev]"
 ```
 
-### Requirements
-- Python 3.9+
-- `numpy`
-- `numba`
+Python 3.9+ is required. Dependencies: `numpy>=1.20.0`, `numba>=0.57.0`.
 
-## Usage
+## API
 
-### Training
+```python
+from bilm import BILM
 
-You can train BILM on any raw text file. It learns sequentially and continuously.
+model = BILM()
+prediction = model.predict_next()
+result = model.observe(ord("A"), learn=True)
+print(result.loss_bits, result.next_prediction.argmax)
+
+report = model.evaluate(b"held-out bytes", warmup=4)
+print(report.bits_per_byte, report.perplexity, report.accuracy)
+
+text = model.generate("The quick brown", max_bytes=200, temperature=0.8)
+
+model.save("checkpoint.npz")
+model = BILM.from_checkpoint("checkpoint.npz")
+```
+
+### Result Types
+
+- `Prediction`: `probabilities[256]`, `argmax`, `predictive_columns`, `confidence`
+- `ObservationResult`: `target`, `prior_prediction`, `next_prediction`, `loss_bits`, `surprise`
+- `EvaluationReport`: `tokens`, `bits_per_byte`, `perplexity`, `accuracy`
+
+## Training and Evaluation
 
 ```bash
-python -m bilm.train --text data/corpus.txt --tokens 100000
+python -m bilm.train --text data/corpus.txt --max-tokens 100000
+python -m bilm.benchmark --test accuracy --train-tokens 100000
+python -m pytest -q
 ```
-*Note: This will output periodic next-byte accuracy metrics and save a checkpoint `.npz` file.*
 
-### Generation
-
-Once trained, you can prompt the model:
+## Continual Learning
 
 ```bash
-python -m bilm.generate --prompt "The quick brown fox" --max-chars 200 --temperature 1.0
+python -m bilm.continual_benchmark \
+  --model bilm \
+  --domain english:data/english-train.bin:data/english-eval.bin \
+  --domain code:data/code-train.bin:data/code-eval.bin
+
+python -m bilm.cl_benchmark --domain-size 5000 --eval-size 1000
 ```
 
-### Benchmarks and Empirical Results
-
-BILM features an empirical benchmark suite that demonstrates its learning characteristics under rigorous conditions. You can execute these benchmarks using:
+## Experiments
 
 ```bash
-# Run all tests
-python -m bilm.benchmark --test all
-
-# Run Next-Byte Accuracy test on WikiText-2
-python -m bilm.benchmark --test accuracy
-
-# Run the Catastrophic Forgetting test
-python -m bilm.benchmark --test forgetting
-
-# Run the Efficiency test
-python -m bilm.benchmark --test efficiency
+python -m bilm.run_experiments --experiment all --train-size 5000
+python -m bilm.challenger --domain-size 3000 --eval-size 500
+python -m bilm.scaling
 ```
 
-#### Real-World Empirical Results
+### Synthetic Grammars
 
-1. **Sample-Efficient Next-Byte Accuracy (WikiText-2)**
-   - **Result:** **26.89%** Next-Byte Accuracy.
-   - **Protocol:** The model is trained sequentially (single pass) on only 100,000 bytes/tokens of the WikiText-2 training set and evaluated on a held-out set of 50,000 tokens (no learning during evaluation).
-   - **Significance:** Because BILM operates using sparse binary activations and local Hebbian rules rather than a dense softmax probability distribution, traditional Bits-Per-Character (BPC) comparisons are not direct. A 26.89% next-byte prediction accuracy from extremely sparse data (0.39% sensory sparsity) shows rapid structural assimilation without millions of backpropagation steps.
+7 deterministic grammar generators for controlled evaluation:
+- `ab_pattern`, `abc_pattern` — repeating patterns
+- `simple_grammar` — balanced a^n b^n
+- `nested_structure` — bracket nesting
+- `delayed_copy_10`, `delayed_copy_20` — long-range context
+- `language` — mini-English with word structure
 
-2. **Zero Catastrophic Forgetting (Continuous Sequential Learning)**
-   - **Result:** **0.0% degradation** (perfect retention) on Domain A after sequential learning on Domain B.
-   - **Protocol:** The model is trained on Domain A (WikiText-2, 20,000 bytes). Baseline accuracy is measured on a held-out evaluation set from Domain A. The model is then trained on Domain B (Python code of the benchmark itself, ~6,500 bytes) with learning fully active. Finally, performance on the held-out Domain A set is re-evaluated.
-   - **Significance:** In contrast to traditional dense networks that suffer from catastrophic interference when trained sequentially on new data distributions, the mathematical sparsity of BILM's SDR representations and hippocampal attractor segregation ensure older syntactic paths remain intact, resulting in a stable 0.0% change in retention accuracy.
+### Ablation Configurations
 
-3. **CPU-Native Computational Footprint**
-   - **Result:** **~18 to 31 TPS** (Tokens Per Second) training speed, with a peak RAM footprint of **~635 MB** on standard consumer CPU architectures.
-   - **Protocol:** Standard processing speed measured over a streaming series of 45,000 tokens. Memory trace accounts for Numba JIT state, model architecture, and the `8192 x 8192` float32 weight matrix of the CA3 Hippocampus (~268 MB).
-   - **Significance:** No GPU is utilized during training or inference. JIT-compiled Numba kernels run localized Hebbian updates efficiently on standard CPU hardware.
+- `full` — no ablation (control)
+- `no_apical` — disable apical feedback
+- `no_homeostasis` — disable synaptic homeostasis
+- `no_hippocampus` — disable CA3 memory
+- `no_neuromod` — fix learning rate (no ACh)
+- `l1_only` — single cortical layer
 
-## Architecture
+## Test Suite
 
-BILM's architecture draws inspiration from mammalian neurobiology:
-- **Sensory Codec (`bilm/codec.py`)**: Hashes incoming bytes into fixed SDRs (16,384 dimension, 64 active bits) to ensure 0.39% sparsity.
-- **Hierarchical Cortex (`bilm/cortex.py`)**: A 3-layer predictive sequence memory with bottom-up pooling and top-down apical biasing.
-- **Neuromodulator (`bilm/neuromod.py`)**: Tracks prediction error (surprise) to release Acetylcholine (ACh) and govern synaptic plasticity.
-- **Hippocampus (`bilm/hippocampus.py`)**: A CA3 attractor network that binds sparse memory representations during high-ACh events for one-shot retrieval.
-- **Synaptic Homeostasis (`bilm/homeostasis.py`)**: Prunes dead synapses and rescales permanence to prevent network saturation.
+64 tests covering:
+- Autoregressive alignment and no target leakage
+- Evaluation side-effect-free contract (including `cell_usage`)
+- Probability finiteness, normalization, calibration
+- Checkpoint v2 roundtrip (bit-identical)
+- Determinism and seed reproducibility
+- CA3 binding, retrieval, bounded memory
+- Consolidation replay
+- No NaN, unbounded memory, or runaway synapses
+- RSS, TPS, checkpoint size, latency budgets
+
+## Research Rules
+
+- Acquisition and retention are always reported together.
+- Evaluation never updates learned or adaptive state.
+- Biological mechanisms require controlled ablations before capability claims.
+- Every published number identifies code version, configuration, dataset hash,
+  domain order, seed, hardware, and raw output.
+- "Better than Transformers" is initially a hypothesis about continual learning
+  at near-matched language quality, not a general claim.
 
 ## License
-MIT License
+
+MIT

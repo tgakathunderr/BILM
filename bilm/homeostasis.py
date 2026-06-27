@@ -2,34 +2,32 @@ from __future__ import annotations
 
 import numpy as np
 
-from bilm.config import (
-    HOMEOSTASIS_EVERY_N,
-    HOMEOSTASIS_FLOOR_RATIO,
-    HOMEOSTASIS_TARGET_SUM_PER_LAYER,
-    MAX_SYNAPSES_PER_CELL,
-    SYNAPSE_CONNECTION_THRESHOLD,
-    SYNAPSE_PRUNE_THRESHOLD,
-)
+from bilm.bilm_config import BILMConfig
 from bilm.kernels import prune_low_permanence_jit
 
 
 class Homeostasis:
     """Per-BILM synaptic rescale + prune. One instance per model."""
 
-    def __init__(self) -> None:
-        self.target_sums = np.asarray(HOMEOSTASIS_TARGET_SUM_PER_LAYER, dtype=np.float32)
-        self.every_n = int(HOMEOSTASIS_EVERY_N)
-        self.prune_threshold = float(SYNAPSE_PRUNE_THRESHOLD)
+    def __init__(self, cfg: BILMConfig | None = None) -> None:
+        self.cfg = cfg or BILMConfig()
+        # Compute target sums dynamically using ratios (0.625, 0.600, 0.575)
+        ratios = (0.625, 0.600, 0.575)
+        self.target_sums = np.asarray(
+            [max(self.cfg.max_synapses * r, 4.0) for r in ratios], dtype=np.float32
+        )
+        self.every_n = int(self.cfg.homeostasis_every_n)
+        self.prune_threshold = float(self.cfg.perm_prune)
         self.step_count = 0
         self.applications = 0
         self.total_pruned = 0
 
         # Safety check: target_sum must keep scaled permanences above connection threshold
-        min_target = MAX_SYNAPSES_PER_CELL * SYNAPSE_CONNECTION_THRESHOLD
+        min_target = self.cfg.max_synapses * self.cfg.perm_threshold
         for idx, target in enumerate(self.target_sums):
             if float(target) < min_target:
                 raise ValueError(
-                    f"HOMEOSTASIS_TARGET_SUM_PER_LAYER[{idx}]={target} is below "
+                    f"Homeostasis target sum[{idx}]={target} is below "
                     f"the safety floor {min_target:.2f}."
                 )
 
@@ -40,7 +38,7 @@ class Homeostasis:
             return False
         for layer_idx, layer in enumerate(cortex.layers):
             target = float(self.target_sums[min(layer_idx, len(self.target_sums) - 1)])
-            self._rescale(layer, target)
+            self._rescale(layer, target, self.cfg.perm_threshold)
             self.total_pruned += int(
                 prune_low_permanence_jit(
                     layer.permanences,
@@ -53,8 +51,8 @@ class Homeostasis:
         return True
 
     @staticmethod
-    def _rescale(layer, target_sum: float) -> None:
-        floor = SYNAPSE_CONNECTION_THRESHOLD * HOMEOSTASIS_FLOOR_RATIO
+    def _rescale(layer, target_sum: float, perm_threshold: float) -> None:
+        floor = perm_threshold * 1.1  # HOMEOSTASIS_FLOOR_RATIO = 1.1
         counts = layer.synapse_counts
         perms = layer.permanences
         for i in range(len(counts)):

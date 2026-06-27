@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 import time
@@ -14,13 +13,11 @@ from bilm.config import (
 )
 
 
-def compute_bpc(surprise_sum: float, n: int) -> float:
-    """Approximate bits-per-character from rolling surprise."""
+def compute_bpc(loss_sum: float, n: int) -> float:
+    """Compute exact mean next-byte loss in bits."""
     if n == 0:
         return float("inf")
-    avg_surprise = surprise_sum / n
-    avg_surprise = max(1e-9, min(1.0 - 1e-9, avg_surprise))
-    return -math.log2(1.0 - avg_surprise)
+    return float(loss_sum) / n
 
 
 def train(
@@ -50,22 +47,21 @@ def train(
     total = len(raw)
     print(f"  Corpus size: {total:,} bytes")
 
-    surprise_sum = 0.0
+    loss_sum = 0.0
     window_count = 0
     t0 = time.time()
 
     for i, b in enumerate(raw):
-        model.tick(int(b), learn=True)
+        result = model.observe(int(b), learn=True)
         ach = model.neuromod.ach
-        surprise = 1.0 - (ach - 0.10) / 0.90
-        surprise_sum += max(0.0, min(1.0, surprise))
+        loss_sum += result.loss_bits
         window_count += 1
 
         local_tokens = model.tokens_seen
 
         # Periodic BPC report
         if local_tokens > 0 and local_tokens % REPORT_EVERY_N_TOKENS == 0:
-            bpc = compute_bpc(surprise_sum, window_count)
+            bpc = compute_bpc(loss_sum, window_count)
             elapsed = time.time() - t0
             tps = local_tokens / max(elapsed, 1e-9)
             pct = (i + 1) / total * 100
@@ -75,7 +71,7 @@ def train(
                 f"ACh={ach:.3f}  "
                 f"TPS={tps:.0f}"
             )
-            surprise_sum = 0.0
+            loss_sum = 0.0
             window_count = 0
 
         # Sleep consolidation

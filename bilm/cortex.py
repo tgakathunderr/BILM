@@ -2,43 +2,32 @@ from __future__ import annotations
 
 import numpy as np
 
-from bilm.config import (
-    APICAL_BIAS_THRESHOLD,
-    APICAL_SOURCE_LAYERS,
-    CELLS_PER_COLUMN,
-    LAYER_DECAY_RATES,
-    LEARNING_RATE_HEBB,
-    MAX_SYNAPSES_PER_CELL,
-    N_CORTICAL_LAYERS,
-    SDR_SIZE,
-    SDR_SPARSITY,
-    SYNAPSE_CONNECTION_THRESHOLD,
-)
+from bilm.bilm_config import BILMConfig
 from bilm.kernels import (
     apply_predictive_rules_jit,
     generate_predictions_jit,
     select_winner_cell_jit,
 )
 
-TOTAL_CELLS: int = SDR_SIZE * CELLS_PER_COLUMN
-
 
 class SparseCortex:
     """One cortical layer. All arrays kept flat for full @njit coverage."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: BILMConfig | None = None) -> None:
+        self.cfg = cfg or BILMConfig()
+        total_cells = self.cfg.sdr_size * self.cfg.cells_per_column
         self.connected_targets = np.full(
-            (TOTAL_CELLS, MAX_SYNAPSES_PER_CELL), -1, dtype=np.int32
+            (total_cells, self.cfg.max_synapses), -1, dtype=np.int32
         )
         self.permanences = np.zeros(
-            (TOTAL_CELLS, MAX_SYNAPSES_PER_CELL), dtype=np.float32
+            (total_cells, self.cfg.max_synapses), dtype=np.float32
         )
-        self.synapse_counts = np.zeros(TOTAL_CELLS, dtype=np.int32)
-        self.active_cells = np.zeros(TOTAL_CELLS, dtype=bool)
-        self.winner_cells = np.zeros(TOTAL_CELLS, dtype=bool)
-        self.predictive_cells = np.zeros(TOTAL_CELLS, dtype=bool)
-        self.prev_winner_cells = np.zeros(TOTAL_CELLS, dtype=bool)
-        self.cell_usage = np.zeros(TOTAL_CELLS, dtype=np.int32)
+        self.synapse_counts = np.zeros(total_cells, dtype=np.int32)
+        self.active_cells = np.zeros(total_cells, dtype=bool)
+        self.winner_cells = np.zeros(total_cells, dtype=bool)
+        self.predictive_cells = np.zeros(total_cells, dtype=bool)
+        self.prev_winner_cells = np.zeros(total_cells, dtype=bool)
+        self.cell_usage = np.zeros(total_cells, dtype=np.int32)
 
     def step(
         self,
@@ -66,11 +55,11 @@ class SparseCortex:
 
         active_pws = np.where(self.prev_winner_cells)[0].astype(np.int32)
         for col_idx in active_columns_idx:
-            start = int(col_idx) * CELLS_PER_COLUMN
-            end = start + CELLS_PER_COLUMN
+            start = int(col_idx) * self.cfg.cells_per_column
+            end = start + self.cfg.cells_per_column
             predicted = self.predictive_cells[start:end]
             if predicted.any():
-                for k in range(CELLS_PER_COLUMN):
+                for k in range(self.cfg.cells_per_column):
                     if predicted[k]:
                         self.active_cells[start + k] = True
                         self.winner_cells[start + k] = True
@@ -83,7 +72,7 @@ class SparseCortex:
                     self.permanences,
                     self.synapse_counts,
                     self.cell_usage,
-                    SYNAPSE_CONNECTION_THRESHOLD,
+                    self.cfg.perm_threshold,
                 )
                 self.active_cells[winner] = True
                 self.winner_cells[winner] = True
@@ -91,7 +80,7 @@ class SparseCortex:
 
         # BIM 2 optimization: skip learning kernel on perfect prediction
         if learn and surprise > 0.0:
-            lr = learn_rate_override if learn_rate_override >= 0.0 else LEARNING_RATE_HEBB
+            lr = learn_rate_override if learn_rate_override >= 0.0 else self.cfg.lr_hebb
             active_cws = np.where(self.winner_cells)[0].astype(np.int32)
             apply_predictive_rules_jit(
                 active_pws,
@@ -101,9 +90,10 @@ class SparseCortex:
                 self.connected_targets,
                 self.permanences,
                 self.synapse_counts,
-                CELLS_PER_COLUMN,
-                MAX_SYNAPSES_PER_CELL,
+                self.cfg.cells_per_column,
+                self.cfg.max_synapses,
                 lr,
+                self.cfg.lr_ltd,
             )
 
         self._generate_predictions()
@@ -114,29 +104,37 @@ class SparseCortex:
         if len(active_sources) == 0:
             self.predictive_cells.fill(False)
             return
-        self.predictive_cells = generate_predictions_jit(
+        total_cells = self.cfg.sdr_size * self.cfg.cells_per_column
+        result = generate_predictions_jit(
             active_sources,
             self.connected_targets,
             self.permanences,
             self.synapse_counts,
-            TOTAL_CELLS,
-            SYNAPSE_CONNECTION_THRESHOLD,
+            total_cells,
+            self.cfg.perm_threshold,
         )
+        self.predictive_cells[:] = result
 
     def get_predictive_columns(self) -> np.ndarray:
         predictive_indices = np.where(self.predictive_cells)[0]
         if len(predictive_indices) == 0:
             return np.array([], dtype=int)
-        return np.unique(predictive_indices // CELLS_PER_COLUMN)
+        return np.unique(predictive_indices // self.cfg.cells_per_column)
 
     def apply_apical_bias(self, bias: np.ndarray) -> None:
         """Top-down apical feedback. Threshold fixed at 0.05 (BIM 3 bug fix)."""
-        high_bias_cols = np.where(bias > APICAL_BIAS_THRESHOLD)[0]
+        high_bias_cols = np.where(bias > self.cfg.apical_bias_threshold)[0]
         for col_idx in high_bias_cols:
-            start = col_idx * CELLS_PER_COLUMN
-            for k in range(CELLS_PER_COLUMN):
+            start = col_idx * self.cfg.cells_per_column
+            activated = False
+            for k in range(self.cfg.cells_per_column):
                 if self.winner_cells[start + k]:
                     self.predictive_cells[start + k] = True
+                    activated = True
+            if not activated:
+                end = start + self.cfg.cells_per_column
+                local = int(np.argmin(self.cell_usage[start:end]))
+                self.predictive_cells[start + local] = True
 
     def reset_context(self) -> None:
         self.active_cells.fill(False)
@@ -158,19 +156,16 @@ class HierarchicalCortex:
     L3: sentence structure       (decay 0.99 — long horizon)
     """
 
-    def __init__(self) -> None:
-        if len(LAYER_DECAY_RATES) != N_CORTICAL_LAYERS:
-            raise ValueError(
-                f"LAYER_DECAY_RATES has {len(LAYER_DECAY_RATES)} entries; "
-                f"expected {N_CORTICAL_LAYERS}"
-            )
+    def __init__(self, cfg: BILMConfig | None = None) -> None:
+        self.cfg = cfg or BILMConfig()
         self.layers: list[SparseCortex] = [
-            SparseCortex() for _ in range(N_CORTICAL_LAYERS)
+            SparseCortex(self.cfg) for _ in range(self.cfg.n_layers)
         ]
         self.temporal_pools: np.ndarray = np.zeros(
-            (N_CORTICAL_LAYERS, SDR_SIZE), dtype=np.float32
+            (cfg.n_layers, cfg.sdr_size), dtype=np.float32
         )
-        self.decay_rates: np.ndarray = np.asarray(LAYER_DECAY_RATES, dtype=np.float32)
+        self.decay_rates: np.ndarray = np.asarray(cfg.layer_decays, dtype=np.float32)
+        self.disable_temporal_pooling: bool = False
 
     def step(
         self,
@@ -183,10 +178,12 @@ class HierarchicalCortex:
         Full cortical step. Returns L1 surprise (used by neuromodulator).
         """
         active_cols = np.asarray(L1_active_columns, dtype=np.int64)
+        if self.disable_temporal_pooling:
+            self.temporal_pools.fill(0.0)
         l1_surprise = 0.0
 
         # Bottom-up pass
-        for i in range(N_CORTICAL_LAYERS):
+        for i in range(self.cfg.n_layers):
             surprise = self.layers[i].step(
                 active_cols,
                 learn=learn,
@@ -197,13 +194,13 @@ class HierarchicalCortex:
             self.temporal_pools[i] *= self.decay_rates[i]
             if len(active_cols) > 0:
                 self.temporal_pools[i, active_cols] += 1.0
-            if i + 1 < N_CORTICAL_LAYERS:
+            if i + 1 < self.cfg.n_layers:
                 active_cols = self._top_k_of_pool(self.temporal_pools[i])
 
         # Top-down apical pass
-        for src in APICAL_SOURCE_LAYERS:
+        for src in self.cfg.apical_source_layers:
             dst = src - 1
-            if src >= N_CORTICAL_LAYERS or dst < 0:
+            if src >= self.cfg.n_layers or dst < 0:
                 continue
             pred_cols = self.layers[src].get_predictive_columns()
             if len(pred_cols) == 0:
@@ -231,14 +228,13 @@ class HierarchicalCortex:
     def total_synapses_per_layer(self) -> list[int]:
         return [layer.total_synapses() for layer in self.layers]
 
-    @staticmethod
-    def _top_k_of_pool(pool: np.ndarray) -> np.ndarray:
+    def _top_k_of_pool(self, pool: np.ndarray) -> np.ndarray:
         if pool.max() <= 0.0:
             return np.array([], dtype=np.int64)
-        return np.argpartition(pool, -SDR_SPARSITY)[-SDR_SPARSITY:]
+        return np.argpartition(pool, -self.cfg.sdr_sparsity)[-self.cfg.sdr_sparsity:]
 
     def _project_apical(self, src_layer: int, src_pred_cols: np.ndarray) -> np.ndarray:
-        apical = np.zeros(SDR_SIZE, dtype=np.float32)
+        apical = np.zeros(self.cfg.sdr_size, dtype=np.float32)
         pool = self.temporal_pools[src_layer]
         apical[src_pred_cols] = pool[src_pred_cols]
         max_val = float(apical.max())

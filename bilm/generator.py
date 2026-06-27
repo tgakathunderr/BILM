@@ -4,19 +4,16 @@ import math
 import numpy as np
 
 from bilm.codec import ByteCodec
-from bilm.config import (
-    GEN_MAX_CHARS_DEFAULT,
-    GEN_REPETITION_PENALTY,
-    GEN_TEMPERATURE,
-    GEN_TOP_K,
-)
+from bilm.bilm_config import BILMConfig
 
 
 class Generator:
     """Stateless SDR → text decoder. Shares the ByteCodec lookup table."""
 
-    def __init__(self, codec: ByteCodec) -> None:
-        self.codec = codec
+    def __init__(self, cfg: BILMConfig | None = None, codec: ByteCodec | None = None) -> None:
+        self.cfg = cfg or BILMConfig()
+        self.codec = codec or ByteCodec(self.cfg)
+        self.rng = np.random.default_rng(7)
 
     def next_byte_argmax(self, predictive_columns: np.ndarray) -> int:
         """Return the single highest-overlap byte. Deterministic."""
@@ -25,55 +22,60 @@ class Generator:
     def next_byte_sample(
         self,
         predictive_columns: np.ndarray,
-        temperature: float = GEN_TEMPERATURE,
-        top_k: int = GEN_TOP_K,
+        temperature: float | None = None,
+        top_k: int | None = None,
         recent_bytes: list[int] | None = None,
     ) -> int:
         """
         Temperature-scaled sampling from top-K candidates.
         Applies repetition penalty on bytes seen in the last 3 outputs.
         """
-        top_ids, top_scores = self.codec.decode_top_k(predictive_columns, top_k=top_k)
-        if len(top_ids) == 0:
-            return ord(" ")  # fallback: space
+        temp = self.cfg.gen_temperature if temperature is None else temperature
+        tk = self.cfg.gen_top_k if top_k is None else top_k
 
-        scores = top_scores.astype(np.float64)
+        scores = self.codec.overlap_scores(predictive_columns).astype(np.float64)
 
-        # Repetition penalty (BIM 3 generation config)
+        # Repetition penalty
         if recent_bytes:
             recent_set = set(recent_bytes[-3:])
-            for i, byte_id in enumerate(top_ids):
-                if int(byte_id) in recent_set:
-                    scores[i] *= GEN_REPETITION_PENALTY
+            for b in recent_set:
+                scores[b] *= self.cfg.gen_repetition_penalty
 
-        # Temperature scaling
-        if temperature <= 0.0:
-            return int(top_ids[np.argmax(scores)])
+        if temp <= 0.0:
+            return int(np.argmax(scores))
 
-        log_scores = np.log(np.maximum(scores, 1e-9)) / temperature
-        log_scores -= log_scores.max()
-        probs = np.exp(log_scores)
+        # Temperature division before np.argpartition
+        logits = np.log(np.maximum(scores, 1e-9)) / float(temp)
+        logits -= logits.max()
+
+        k = min(int(tk), len(logits))
+        top_ids = np.argpartition(logits, -k)[-k:]
+        top_logits = logits[top_ids]
+
+        # Sort descending
+        order = np.argsort(-top_logits)
+        top_ids = top_ids[order]
+        top_logits = top_logits[order]
+
+        # Softmax over top-K
+        probs = np.exp(top_logits)
         probs /= probs.sum()
 
-        chosen_idx = int(np.random.choice(len(top_ids), p=probs))
+        chosen_idx = int(self.rng.choice(len(top_ids), p=probs))
         return int(top_ids[chosen_idx])
 
     def generate_text(
         self,
         model,
         prompt: str,
-        max_chars: int = GEN_MAX_CHARS_DEFAULT,
-        temperature: float = GEN_TEMPERATURE,
+        max_chars: int = 200,
+        temperature: float | None = None,
     ) -> str:
         """
         Generate text by feeding a prompt through the model then sampling.
-
-        Args:
-            model:       BILM instance
-            prompt:      Seed text (fed in without learning to prime the cortex)
-            max_chars:   Number of characters to generate
-            temperature: Sampling temperature (0 = argmax, >0 = stochastic)
         """
+        temp = self.cfg.gen_temperature if temperature is None else temperature
+
         # Prime the cortex with the prompt (no learning during generation)
         for b in prompt.encode("utf-8", errors="replace"):
             model.tick(b, learn=False)
@@ -81,16 +83,21 @@ class Generator:
         output_bytes: list[int] = []
 
         for _ in range(max_chars):
-            pred_cols = model.cortex.get_predictive_columns()
+            prediction = model.predict_next()
+            probabilities = prediction.probabilities.copy()
+            if output_bytes:
+                for byte_id in set(output_bytes[-3:]):
+                    probabilities[byte_id] *= self.cfg.gen_repetition_penalty
+                probabilities /= probabilities.sum()
 
-            if temperature == 0.0:
-                next_b = self.next_byte_argmax(pred_cols)
+            if temp <= 0.0:
+                next_b = int(np.argmax(probabilities))
             else:
-                next_b = self.next_byte_sample(
-                    pred_cols,
-                    temperature=temperature,
-                    recent_bytes=output_bytes,
-                )
+                logits = np.log(np.maximum(probabilities, 1e-12)) / temp
+                logits -= logits.max()
+                sample_probs = np.exp(logits)
+                sample_probs /= sample_probs.sum()
+                next_b = int(self.rng.choice(len(sample_probs), p=sample_probs))
 
             if next_b < 0:
                 next_b = ord(" ")

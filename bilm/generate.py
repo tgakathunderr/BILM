@@ -32,7 +32,7 @@ def main() -> None:
     print("-" * 50)
     output = model.generate(
         prompt=args.prompt,
-        max_chars=args.max_chars,
+        max_bytes=args.max_chars,
         temperature=args.temperature,
     )
     print(args.prompt + output)

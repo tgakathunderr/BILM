@@ -46,6 +46,8 @@ HIPPO_LTD: float = -0.02
 HIPPO_RETRIEVE_ITER: int = 8
 HIPPO_BIND_SURPRISE_THRESHOLD: float = 0.60
 HIPPO_WEIGHT_MAX: float = 1.0
+HIPPO_MAX_SYNAPSES_PER_CELL: int = 64
+HIPPO_INITIAL_PERMANENCE: float = 0.50
 
 # ---------------------------------------------------------------------------
 # Neuromodulator (ACh)  [BIM 3 base + BIM 4 variance habituation]
@@ -70,6 +72,11 @@ GEN_TEMPERATURE: float = 0.8
 GEN_TOP_K: int = 32
 GEN_REPETITION_PENALTY: float = 0.6
 GEN_MAX_CHARS_DEFAULT: int = 200
+READOUT_TEMPERATURE: float = 1.0
+READOUT_LEARNING_RATE: float = 0.05
+READOUT_BIAS_LEARNING_RATE: float = 0.01
+READOUT_OVERLAP_SCALE: float = 1.0
+RANDOM_SEED: int = 7
 
 # ---------------------------------------------------------------------------
 # Training

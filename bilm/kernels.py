@@ -22,6 +22,7 @@ def apply_predictive_rules_jit(
     CELLS_PER_COLUMN: int,
     MAX_SYNAPSES_PER_CELL: int,
     learning_rate_hebb: float = LEARNING_RATE_HEBB,
+    learning_rate_ltd: float = LEARNING_RATE_LTD,
 ) -> None:
     """Hebbian growth + potentiation, plus sequential LTD. Local rule only."""
     if len(prev_winners) == 0 or len(current_winners) == 0:
@@ -65,7 +66,7 @@ def apply_predictive_rules_jit(
                 count = synapse_counts[pw]
                 for i in range(count):
                     if connected_targets[pw, i] == p_cell:
-                        permanences[pw, i] += LEARNING_RATE_LTD
+                        permanences[pw, i] += learning_rate_ltd
                         if permanences[pw, i] < 0.0:
                             permanences[pw, i] = 0.0
                         break
@@ -109,7 +110,7 @@ def select_winner_cell_jit(
     if not has_prev:
         best_cell = col_start
         for cell_idx in range(col_start + 1, col_end):
-            if cell_usage[cell_idx] > cell_usage[best_cell]:
+            if cell_usage[cell_idx] < cell_usage[best_cell]:
                 best_cell = cell_idx
         return best_cell
 

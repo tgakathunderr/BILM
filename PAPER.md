@@ -1,8 +1,14 @@
 ---
+
 title: "BILM: A Biologically Inspired Sequence Model with High Sample Efficiency and Resistance to Catastrophic Forgetting"
 author: "Nucleus AI"
 date: "June 2026"
 ---
+
+> **Historical draft — results not valid for BILM 2.** The accuracy and forgetting
+> numbers below predate correction of autoregressive evaluation alignment and the
+> normalized probabilistic readout. They remain as project history and must be rerun
+> before citation.
 
 # Abstract
 

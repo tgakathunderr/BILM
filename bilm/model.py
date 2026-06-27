@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import numpy as np
 
 from bilm.codec import ByteCodec
@@ -9,7 +10,11 @@ from bilm.neuromod import Neuromod
 from bilm.homeostasis import Homeostasis
 from bilm.hippocampus import Hippocampus
 from bilm.generator import Generator
+from bilm.readout import LocalByteReadout
 from bilm.config import CHECKPOINT_DIR
+from bilm.metrics import target_loss_bits, bits_per_byte, byte_perplexity
+from bilm.results import Prediction, ObservationResult, EvaluationReport
+from bilm.bilm_config import BILMConfig
 
 
 class BILM:
@@ -22,79 +27,182 @@ class BILM:
         text = model.generate("The quick brown")
     """
 
-    def __init__(self) -> None:
-        self.codec = ByteCodec()
-        self.cortex = HierarchicalCortex()
-        self.neuromod = Neuromod()
-        self.homeostasis = Homeostasis()
-        self.hippocampus = Hippocampus()
-        self.generator = Generator(self.codec)
+    def __init__(self, config: BILMConfig | None = None) -> None:
+        self.cfg         = config or BILMConfig()
+        self.codec       = ByteCodec(self.cfg)
+        self.cortex      = HierarchicalCortex(self.cfg)
+        self.neuromod    = Neuromod(self.cfg)
+        self.homeostasis = Homeostasis(self.cfg)
+        self.hippocampus = Hippocampus(self.cfg)
+        self.generator   = Generator(self.cfg, self.codec)
+        self.readout     = LocalByteReadout(self.cfg)
         self.tokens_seen: int = 0
 
     # ------------------------------------------------------------------
     # Core tick — BIM 4 tick() architecture
     # ------------------------------------------------------------------
 
+    def predict_next(self, temperature: float = 1.0) -> Prediction:
+        """Return the next-byte distribution implied by the current context."""
+        columns = self.cortex.get_predictive_columns().astype(np.int64, copy=True)
+        probabilities = self.readout.predict(columns, self.codec, temperature)
+        argmax = int(np.argmax(probabilities))
+        return Prediction(
+            probabilities=probabilities,
+            argmax=argmax,
+            predictive_columns=columns,
+            confidence=float(probabilities[argmax]),
+        )
+
+    def observe(self, byte_val: int, learn: bool = True) -> ObservationResult:
+        """Score and consume one byte, optionally applying online learning."""
+        target = int(byte_val) & 0xFF
+        prior = self.predict_next()
+        loss = target_loss_bits(prior.probabilities, target)
+
+        if learn:
+            self.readout.learn(
+                prior.predictive_columns, prior.probabilities, target
+            )
+
+        sdr_cols = self.codec.encode(target, track=learn)
+        hab_scale = self.codec.habituation_scale(target)
+        lr = self.neuromod.lr_scale(hab_scale) if learn else 0.0
+        surprise = self.cortex.step(sdr_cols, learn=learn, learn_rate_override=lr)
+
+        if learn:
+            self.neuromod.update(surprise)
+            self.homeostasis.maybe_apply(self.cortex)
+
+            cortical_context = self.cortex.get_layer_sdr(self.cfg.n_layers - 1)
+            bound = self.hippocampus.maybe_bind(cortical_context, surprise)
+            if not bound and surprise > 0.3:
+                retrieved = self.hippocampus.retrieve(cortical_context)
+                if retrieved.size > 0:
+                    self.hippocampus.apply_to_cortex(retrieved, self.cortex)
+            self.tokens_seen += 1
+
+        return ObservationResult(
+            target=target,
+            prior_prediction=prior,
+            next_prediction=self.predict_next(),
+            loss_bits=loss,
+            surprise=float(surprise),
+        )
+
     def tick(self, byte_val: int, learn: bool = True) -> int:
         """
         Process one byte through the full biological pipeline.
         Returns the predicted next byte (argmax).
-
-        Pipeline order:
-          1. Codec:       byte → SDR
-          2. Cortex:      SDR → prediction + surprise (Hebbian if learn=True)
-          3. Neuromod:    surprise → ACh update
-          4. Homeostasis: fire every N tokens
-          5. Hippocampus: bind if surprise high; retrieve and apply apical bias
-          6. Generator:   predicted columns → next byte
         """
-        # 1. Encode
-        sdr_cols = self.codec.encode(byte_val)
+        return self.observe(byte_val, learn=learn).next_prediction.argmax
 
-        # 2. Cortex step
-        hab_scale = self.codec.habituation_scale(byte_val)
-        lr = self.neuromod.lr_scale(hab_scale) if learn else 0.0
-        surprise = self.cortex.step(sdr_cols, learn=learn, learn_rate_override=lr)
+    def evaluate(
+        self,
+        data: bytes,
+        *,
+        warmup: int = 0,
+        reset_context: bool = True,
+    ) -> EvaluationReport:
+        """Evaluate autoregressively without mutating persistent model state."""
+        context = self._capture_context()
+        losses: list[float] = []
+        correct = 0
+        try:
+            if reset_context:
+                self.cortex.reset_context()
+            for index, value in enumerate(data):
+                result = self.observe(value, learn=False)
+                if index >= warmup:
+                    losses.append(result.loss_bits)
+                    correct += int(result.prior_prediction.argmax == int(value))
+        finally:
+            self._restore_context(context)
+        bpb = bits_per_byte(losses)
+        return EvaluationReport(
+            tokens=len(losses),
+            bits_per_byte=bpb,
+            perplexity=byte_perplexity(bpb),
+            accuracy=(correct / len(losses)) if losses else 0.0,
+        )
 
-        # 3. Neuromod update
-        if learn:
-            self.neuromod.update(surprise)
+    def _capture_context(self) -> dict:
+        return {
+            "pools": self.cortex.temporal_pools.copy(),
+            "layers": [
+                (
+                    layer.active_cells.copy(),
+                    layer.winner_cells.copy(),
+                    layer.predictive_cells.copy(),
+                    layer.prev_winner_cells.copy(),
+                    layer.cell_usage.copy(),
+                )
+                for layer in self.cortex.layers
+            ],
+            "codec_frequencies": self.codec.frequencies.copy(),
+            "codec_total_seen": self.codec.total_seen,
+            "readout_state": self.readout.save_state() if hasattr(self.readout, "save_state") else {
+                "weights": self.readout.weights.copy(),
+                "bias": self.readout.bias.copy(),
+            },
+            "neuromod_surprise": list(self.neuromod._surprise_history),
+            "neuromod_variance": list(self.neuromod._variance_window),
+            "neuromod_ach": self.neuromod.ach,
+            "homeostasis_step_count": self.homeostasis.step_count,
+            "homeostasis_applications": self.homeostasis.applications,
+            "homeostasis_total_pruned": self.homeostasis.total_pruned,
+            "hippo_binds": self.hippocampus.binds,
+            "hippo_retrievals": self.hippocampus.retrievals,
+            "hippo_last_active": self.hippocampus.last_active.copy(),
+            "tokens_seen": self.tokens_seen,
+        }
 
-        # 4. Homeostasis
-        if learn:
-            self.homeostasis.maybe_apply(self.cortex)
-
-        # 5. Hippocampus
-        if learn:
-            current_cols = self.cortex.get_predictive_columns()
-            bound = self.hippocampus.maybe_bind(sdr_cols, surprise)
-            if not bound and surprise > 0.3:
-                # Try retrieval to inject long-context prior
-                retrieved = self.hippocampus.retrieve(sdr_cols)
-                if retrieved.size > 0:
-                    self.hippocampus.apply_to_cortex(retrieved, self.cortex)
-
-        # 6. Generate prediction for next byte
-        pred_cols = self.cortex.get_predictive_columns()
-        next_byte = self.generator.next_byte_argmax(pred_cols)
-
-        if learn:
-            self.tokens_seen += 1
-
-        return next_byte
+    def _restore_context(self, state: dict) -> None:
+        self.cortex.temporal_pools[:] = state["pools"]
+        for layer, values in zip(self.cortex.layers, state["layers"]):
+            layer.active_cells[:], layer.winner_cells[:], layer.predictive_cells[:], layer.prev_winner_cells[:] = values[:4]
+            layer.cell_usage[:] = values[4]
+        self.codec.frequencies[:] = state["codec_frequencies"]
+        self.codec.total_seen = state["codec_total_seen"]
+        if hasattr(self.readout, "load_state"):
+            self.readout.load_state(state["readout_state"])
+        else:
+            self.readout.weights[:] = state["readout_state"]["weights"]
+            self.readout.bias[:] = state["readout_state"]["bias"]
+        self.neuromod._surprise_history.clear()
+        self.neuromod._surprise_history.extend(state["neuromod_surprise"])
+        self.neuromod._variance_window.clear()
+        self.neuromod._variance_window.extend(state["neuromod_variance"])
+        self.neuromod.ach = state["neuromod_ach"]
+        self.homeostasis.step_count = state["homeostasis_step_count"]
+        self.homeostasis.applications = state["homeostasis_applications"]
+        self.homeostasis.total_pruned = state["homeostasis_total_pruned"]
+        self.hippocampus.binds = state["hippo_binds"]
+        self.hippocampus.retrievals = state["hippo_retrievals"]
+        self.hippocampus.last_active = state["hippo_last_active"]
+        self.tokens_seen = state["tokens_seen"]
 
     # ------------------------------------------------------------------
     # Sleep consolidation (BIM 4)
     # ------------------------------------------------------------------
 
-    def sleep(self) -> None:
+    def sleep(self, n_replays: int = 32, learning_rate: float = 0.02) -> dict:
         """
-        Offline consolidation. Not implemented as replay in BILM v1 because
-        the Hippocampus stores weight-space attractors, not episode lists.
-        Sleep in BILM = reset cortical context so the next sequence starts fresh.
-        The Hippocampus weights persist across sleep.
+        Offline neural consolidation through internally reactivated CA3 attractors.
         """
+        replays = 0
         self.cortex.reset_context()
+        for pattern in self.hippocampus.replay_patterns(n_replays):
+            columns = self.hippocampus.cortical_columns_for(pattern)
+            if columns.size:
+                self.cortex.step(
+                    columns,
+                    learn=True,
+                    learn_rate_override=float(learning_rate),
+                )
+                replays += 1
+        self.cortex.reset_context()
+        return {"replays": replays, "learning_rate": float(learning_rate)}
 
     # ------------------------------------------------------------------
     # Text interface
@@ -103,32 +211,36 @@ class BILM:
     def train_on_text(self, text: str) -> list[float]:
         """
         Train on a string, byte by byte. Returns per-token BPC list.
-        BPC = -log2(P(correct)) ≈ -log2(overlap/SDR_SPARSITY)
         """
         bpc_log: list[float] = []
         data = text.encode("utf-8", errors="replace")
         for b in data:
-            next_pred = self.tick(int(b), learn=True)
-            # Approximate BPC from surprise in next neuromod state
-            surprise = 1.0 - (self.neuromod.ach - 0.10) / 0.90
-            surprise = max(1e-9, min(1.0, surprise))
-            bpc = -float(np.log2(max(1e-9, 1.0 - surprise)))
-            bpc_log.append(bpc)
+            result = self.observe(int(b), learn=True)
+            bpc_log.append(result.loss_bits)
         return bpc_log
 
     def generate(
         self,
         prompt: str,
-        max_chars: int = 200,
+        max_bytes: int = 200,
         temperature: float = 0.8,
     ) -> str:
         """Generate text from a prompt."""
         return self.generator.generate_text(
             self,
             prompt=prompt,
-            max_chars=max_chars,
+            max_chars=max_bytes,
             temperature=temperature,
         )
+
+    def train_on_file(self, path: str, max_tokens: int | None = None) -> None:
+        """Train on a file, byte by byte."""
+        with open(path, "rb") as f:
+            data = f.read()
+        if max_tokens is not None:
+            data = data[:max_tokens]
+        for b in data:
+            self.observe(int(b), learn=True)
 
     # ------------------------------------------------------------------
     # Checkpoint
@@ -152,10 +264,36 @@ class BILM:
         arrays["cortex_pools"] = self.cortex.temporal_pools
 
         # Hippocampus
-        arrays["hippo_W"] = self.hippocampus.W
+        arrays["hippo_targets"] = self.hippocampus.targets
+        arrays["hippo_weights"] = self.hippocampus.weights
+        arrays["hippo_counts"] = self.hippocampus.counts
+        arrays["readout_weights"] = self.readout.weights
+        arrays["readout_bias"] = self.readout.bias
+        arrays["readout_updates"] = np.array([self.readout.updates], dtype=np.int64)
 
         # Codec frequencies
         arrays["codec_frequencies"] = self.codec.frequencies
+        arrays["codec_total_seen"] = np.array([self.codec.total_seen], dtype=np.int64)
+        arrays["neuromod_surprise"] = np.asarray(self.neuromod._surprise_history, dtype=np.float64)
+        arrays["neuromod_variance"] = np.asarray(self.neuromod._variance_window, dtype=np.float64)
+        arrays["neuromod_ach"] = np.array([self.neuromod.ach], dtype=np.float64)
+        arrays["homeostasis_state"] = np.array([
+            self.homeostasis.step_count,
+            self.homeostasis.applications,
+            self.homeostasis.total_pruned,
+        ], dtype=np.int64)
+        arrays["hippo_last_active"] = self.hippocampus.last_active
+        arrays["hippo_counters"] = np.array([
+            self.hippocampus.binds, self.hippocampus.retrievals
+        ], dtype=np.int64)
+        for i, layer in enumerate(self.cortex.layers):
+            arrays[f"cortex_L{i}_active"] = layer.active_cells
+            arrays[f"cortex_L{i}_winner"] = layer.winner_cells
+            arrays[f"cortex_L{i}_predictive"] = layer.predictive_cells
+            arrays[f"cortex_L{i}_prev_winner"] = layer.prev_winner_cells
+        rng_json = json.dumps(self.generator.rng.bit_generator.state).encode("utf-8")
+        arrays["generator_rng"] = np.frombuffer(rng_json, dtype=np.uint8)
+        arrays["checkpoint_version"] = np.array([2], dtype=np.int64)
 
         # Metadata
         arrays["tokens_seen"] = np.array([self.tokens_seen], dtype=np.int64)
@@ -165,18 +303,61 @@ class BILM:
 
     def load(self, path: str) -> None:
         """Load weights from a .npz checkpoint."""
-        data = np.load(path)
+        data = np.load(path, allow_pickle=False)
 
         for i, layer in enumerate(self.cortex.layers):
             layer.connected_targets[:] = data[f"cortex_L{i}_targets"]
             layer.permanences[:] = data[f"cortex_L{i}_perms"]
             layer.synapse_counts[:] = data[f"cortex_L{i}_counts"]
             layer.cell_usage[:] = data[f"cortex_L{i}_usage"]
+            for suffix, target in (
+                ("active", layer.active_cells),
+                ("winner", layer.winner_cells),
+                ("predictive", layer.predictive_cells),
+                ("prev_winner", layer.prev_winner_cells),
+            ):
+                key = f"cortex_L{i}_{suffix}"
+                if key in data:
+                    target[:] = data[key]
 
         self.cortex.temporal_pools[:] = data["cortex_pools"]
-        self.hippocampus.W[:] = data["hippo_W"]
+        if "hippo_targets" in data:
+            self.hippocampus.targets[:] = data["hippo_targets"]
+            self.hippocampus.weights[:] = data["hippo_weights"]
+            self.hippocampus.counts[:] = data["hippo_counts"]
+        if "readout_weights" in data:
+            self.readout.weights[:] = data["readout_weights"]
+            self.readout.bias[:] = data["readout_bias"]
+            self.readout.updates = int(data["readout_updates"][0])
         self.codec.frequencies[:] = data["codec_frequencies"]
         self.tokens_seen = int(data["tokens_seen"][0])
+        if "codec_total_seen" in data:
+            self.codec.total_seen = int(data["codec_total_seen"][0])
+        if "neuromod_surprise" in data:
+            self.neuromod._surprise_history.clear()
+            self.neuromod._variance_window.clear()
+            self.neuromod._surprise_history.extend(data["neuromod_surprise"].tolist())
+            self.neuromod._variance_window.extend(data["neuromod_variance"].tolist())
+            self.neuromod.ach = float(data["neuromod_ach"][0])
+        if "homeostasis_state" in data:
+            hs = data["homeostasis_state"]
+            self.homeostasis.step_count = int(hs[0])
+            self.homeostasis.applications = int(hs[1])
+            self.homeostasis.total_pruned = int(hs[2])
+        if "hippo_last_active" in data:
+            self.hippocampus.last_active = data["hippo_last_active"].copy()
+            self.hippocampus.binds = int(data["hippo_counters"][0])
+            self.hippocampus.retrievals = int(data["hippo_counters"][1])
+        if "generator_rng" in data:
+            state = json.loads(data["generator_rng"].tobytes().decode("utf-8"))
+            self.generator.rng.bit_generator.state = state
+
+    @classmethod
+    def from_checkpoint(cls, path: str, config: BILMConfig | None = None) -> "BILM":
+        """Create a new BILM instance and load state from a checkpoint."""
+        model = cls(config)
+        model.load(path)
+        return model
 
     # ------------------------------------------------------------------
     # Stats

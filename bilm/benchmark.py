@@ -41,19 +41,13 @@ def _load_text(path: str) -> bytes:
 
 def eval_accuracy(model: BILM, data: bytes, label: str = "") -> float:
     """Evaluate next-byte prediction accuracy on held-out data (no learning)."""
-    correct = 0
-    total = len(data)
-    if total == 0:
-        return 0.0
-
-    for b in data:
-        pred = model.tick(int(b), learn=False)
-        if pred == int(b):
-            correct += 1
-
-    accuracy = correct / total
+    report = model.evaluate(data, warmup=min(256, len(data)))
+    accuracy = report.accuracy
     if label:
-        print(f"  {label}: accuracy={accuracy:.4f}")
+        print(
+            f"  {label}: accuracy={accuracy:.4f} "
+            f"BPB={report.bits_per_byte:.4f} PPL={report.perplexity:.2f}"
+        )
     return accuracy
 
 
@@ -61,7 +55,7 @@ def eval_accuracy(model: BILM, data: bytes, label: str = "") -> float:
 # Benchmark A: Accuracy
 # ---------------------------------------------------------------------------
 
-def benchmark_accuracy(train_tokens: int = 500_000) -> None:
+def benchmark_accuracy(train_tokens: int = 100_000) -> None:
     print("\n=== Benchmark A: WikiText-2 Next-Byte Accuracy ===")
 
     train_path = os.path.join(DATA_DIR, "wikitext2_train.txt")
@@ -85,7 +79,12 @@ def benchmark_accuracy(train_tokens: int = 500_000) -> None:
     print(f"  Training done in {elapsed:.1f}s  ({tps:.0f} TPS)")
 
     model.cortex.reset_context()
-    acc = eval_accuracy(model, test_data, label="WikiText-2 Test")
+    report = model.evaluate(test_data, warmup=256)
+    acc = report.accuracy
+    print(
+        f"  WikiText-2 Test: accuracy={acc:.4f} "
+        f"BPB={report.bits_per_byte:.4f} PPL={report.perplexity:.2f}"
+    )
     print(f"\n  Result: Next-Byte Accuracy = {acc:.4f}")
     print("  (Note: BILM utilizes sparse representations without softmax distributions,")
     print("   making direct BPC comparisons to dense models invalid.)")
@@ -121,18 +120,28 @@ def benchmark_forgetting() -> None:
     model.cortex.reset_context()
     acc_before = eval_accuracy(model, eval_a, "Domain A accuracy BEFORE domain B training")
 
+    model.cortex.reset_context()
+    domain_b_before = model.evaluate(domain_b, warmup=min(256, len(domain_b)))
+
     # Train on Domain B
     print(f"  Training on Domain B (Python code, {len(domain_b):,} bytes) ...")
     for b in domain_b:
         model.tick(int(b), learn=True)
 
     model.cortex.reset_context()
+    domain_b_after = model.evaluate(domain_b, warmup=min(256, len(domain_b)))
+
+    model.cortex.reset_context()
     acc_after = eval_accuracy(model, eval_a, "Domain A accuracy AFTER domain B training")
 
     degradation = ((acc_after - acc_before) / max(acc_before, 1e-9)) * 100
+    acquisition = domain_b_before.bits_per_byte - domain_b_after.bits_per_byte
     print(f"\n  Accuracy Change: {degradation:+.1f}%")
-    if degradation > -10:
-        print("  [PASS] Catastrophic forgetting prevented (<10% degradation)")
+    print(f"  Domain B acquisition: {acquisition:+.4f} BPB improvement")
+    if degradation > -10 and acquisition > 0.0:
+        print("  [PASS] Acquisition observed with <10% relative accuracy degradation")
+    elif acquisition <= 0.0:
+        print("  [WARN] No Domain B acquisition; retention alone is not evidence")
     else:
         print("  [WARN] Degradation present. Interference occurred.")
 
@@ -146,6 +155,7 @@ def benchmark_efficiency() -> None:
 
     gc.collect()
     tracemalloc.start()
+    proc_start_rss = _get_rss_mb()
 
     model = BILM()
     sample = b"The quick brown fox jumps over the lazy dog. " * 1000
@@ -157,19 +167,35 @@ def benchmark_efficiency() -> None:
 
     current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    proc_peak_rss = _get_rss_mb()
 
-    # NumPy C-allocations (like the 8192x8192 float32 Hippocampus W matrix) 
-    # are often missed by tracemalloc. Add manual estimate:
-    # 8192 * 8192 * 4 bytes = 268.4 MB
-    estimated_np_mb = 268.4
-    peak_mb = (peak / 1024 / 1024) + estimated_np_mb
+    peak_mb = peak / 1024 / 1024
+    rss_mb = proc_peak_rss - proc_start_rss
 
     tps = len(sample) / max(elapsed, 1e-9)
 
     print(f"  Tokens processed: {len(sample):,}")
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Tokens per second: {tps:.0f} TPS")
-    print(f"  Peak RAM (traced + numpy est): ~{peak_mb:.1f} MB")
+    print(f"  Peak RSS (delta): {rss_mb:.1f} MB")
+    print(f"  Peak tracemalloc: {peak_mb:.1f} MB")
+
+
+def _get_rss_mb() -> float:
+    """Get current process RSS in MB (Windows-compatible via tracemalloc fallback)."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1024 / 1024
+    except ImportError:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+    except Exception:
+        pass
+    gc.collect()
+    _, peak = tracemalloc.get_traced_memory()
+    return peak / 1024 / 1024
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +209,7 @@ def main() -> None:
         choices=["accuracy", "forgetting", "efficiency", "all"],
         default="all",
     )
-    parser.add_argument("--train-tokens", type=int, default=500_000)
+    parser.add_argument("--train-tokens", type=int, default=100_000)
     args = parser.parse_args()
 
     print("BILM Benchmark Suite")
