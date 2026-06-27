@@ -1,8 +1,114 @@
-from __future__ import annotations
-
+import numba
 import numpy as np
-
 from bilm.bilm_config import BILMConfig
+
+
+@numba.njit
+def hebbian_bind_jit(
+    active_cells: np.ndarray,
+    targets: np.ndarray,
+    weights: np.ndarray,
+    counts: np.ndarray,
+    hippo_max_synapses: int,
+    hippo_lr: float,
+) -> None:
+    cells = np.unique(active_cells)
+    for source in cells:
+        candidates = cells[cells != source]
+        if candidates.size > hippo_max_synapses:
+            offset = int(source) % candidates.size
+            n = candidates.size
+            rolled = np.empty_like(candidates)
+            for idx in range(n):
+                rolled[idx] = candidates[(idx + offset) % n]
+            candidates = rolled[:hippo_max_synapses]
+            
+        count = int(counts[source])
+        for target in candidates:
+            existing_idx = -1
+            for idx in range(count):
+                if targets[source, idx] == target:
+                    existing_idx = idx
+                    break
+            
+            if existing_idx != -1:
+                weights[source, existing_idx] = min(
+                    1.0,
+                    float(weights[source, existing_idx]) + hippo_lr,
+                )
+            elif count < hippo_max_synapses:
+                targets[source, count] = int(target)
+                weights[source, count] = 0.50
+                count += 1
+            else:
+                min_idx = 0
+                min_val = weights[source, 0]
+                for idx in range(1, count):
+                    if weights[source, idx] < min_val:
+                        min_val = weights[source, idx]
+                        min_idx = idx
+                if min_val <= 0.50:
+                    targets[source, min_idx] = int(target)
+                    weights[source, min_idx] = 0.50
+        counts[source] = count
+
+
+@numba.njit
+def retrieve_ca3_jit(
+    cue: np.ndarray,
+    targets: np.ndarray,
+    weights: np.ndarray,
+    counts: np.ndarray,
+    hippo_size: int,
+    hippo_retrieve_iter: int,
+    hippo_sparsity: int,
+) -> np.ndarray:
+    cue = np.unique(cue)
+    if cue.size == 0:
+        return np.empty(0, dtype=np.int32)
+    state = cue
+    for _ in range(hippo_retrieve_iter):
+        energy = np.zeros(hippo_size, dtype=np.float32)
+        for source in state:
+            count = int(counts[source])
+            if count > 0:
+                for idx in range(count):
+                    t = targets[source, idx]
+                    energy[t] += weights[source, idx]
+        
+        pos_count = 0
+        positive = np.empty(hippo_size, dtype=np.int32)
+        for idx in range(hippo_size):
+            if energy[idx] > 0.0:
+                positive[pos_count] = idx
+                pos_count += 1
+        
+        if pos_count == 0:
+            break
+            
+        k = min(hippo_sparsity, pos_count)
+        pos_energy = np.empty(pos_count, dtype=np.float32)
+        pos_indices = np.empty(pos_count, dtype=np.int32)
+        for idx in range(pos_count):
+            pos_indices[idx] = positive[idx]
+            pos_energy[idx] = energy[positive[idx]]
+            
+        args = np.argsort(pos_energy)
+        selected = pos_indices[args[-k:]]
+        selected = np.sort(selected)
+        
+        if selected.size == state.size:
+            same = True
+            for idx in range(selected.size):
+                if selected[idx] != state[idx]:
+                    same = False
+                    break
+            if same:
+                state = selected
+                break
+        state = selected
+        
+    return state
 
 
 def _project_cortex_to_hippo(cortex_cols: np.ndarray, cfg: BILMConfig | None = None) -> np.ndarray:
@@ -46,31 +152,14 @@ class Hippocampus:
         return True
 
     def _hebbian_bind(self, active_cells: np.ndarray) -> None:
-        cells = np.unique(np.asarray(active_cells, dtype=np.int32))
-        for source in cells:
-            candidates = cells[cells != source]
-            if candidates.size > self.cfg.hippo_max_synapses:
-                offset = int(source) % candidates.size
-                candidates = np.roll(candidates, -offset)[:self.cfg.hippo_max_synapses]
-            count = int(self.counts[source])
-            for target in candidates:
-                existing = np.where(self.targets[source, :count] == target)[0]
-                if existing.size:
-                    slot = int(existing[0])
-                    self.weights[source, slot] = min(
-                        1.0,  # HIPPO_WEIGHT_MAX
-                        float(self.weights[source, slot]) + self.cfg.hippo_lr,
-                    )
-                elif count < self.cfg.hippo_max_synapses:
-                    self.targets[source, count] = int(target)
-                    self.weights[source, count] = 0.50  # HIPPO_INITIAL_PERMANENCE
-                    count += 1
-                else:
-                    slot = int(np.argmin(self.weights[source, :count]))
-                    if self.weights[source, slot] <= 0.50:
-                        self.targets[source, slot] = int(target)
-                        self.weights[source, slot] = 0.50
-            self.counts[source] = count
+        hebbian_bind_jit(
+            active_cells.astype(np.int32),
+            self.targets,
+            self.weights,
+            self.counts,
+            self.cfg.hippo_max_synapses,
+            self.cfg.hippo_lr,
+        )
 
     def retrieve(self, cue_cortex_cols: np.ndarray) -> np.ndarray:
         cue = self._project_cortex_to_hippo(cue_cortex_cols)
@@ -78,29 +167,17 @@ class Hippocampus:
 
     def retrieve_ca3(self, cue: np.ndarray) -> np.ndarray:
         """Settle recurrent dynamics from an already projected CA3 cue."""
-        cue = np.unique(np.asarray(cue, dtype=np.int32))
-        if cue.size == 0:
-            return np.array([], dtype=np.int32)
-        state = cue
-        for _ in range(int(self.cfg.hippo_retrieve_iter)):
-            energy = np.zeros(self.cfg.hippo_size, dtype=np.float32)
-            for source in state:
-                count = int(self.counts[source])
-                if count:
-                    targets = self.targets[source, :count]
-                    np.add.at(energy, targets, self.weights[source, :count])
-            positive = np.flatnonzero(energy > 0.0)
-            if positive.size == 0:
-                break
-            k = min(self.cfg.hippo_sparsity, positive.size)
-            selected = positive[np.argpartition(energy[positive], -k)[-k:]]
-            selected = np.sort(selected.astype(np.int32))
-            if np.array_equal(selected, np.sort(state)):
-                state = selected
-                break
-            state = selected
+        ret = retrieve_ca3_jit(
+            cue.astype(np.int32),
+            self.targets,
+            self.weights,
+            self.counts,
+            self.cfg.hippo_size,
+            int(self.cfg.hippo_retrieve_iter),
+            self.cfg.hippo_sparsity,
+        )
         self.retrievals += 1
-        self.last_active = state.copy()
+        self.last_active = ret.copy()
         return self.last_active
 
     def replay_patterns(self, n: int = 32) -> list[np.ndarray]:

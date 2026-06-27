@@ -10,7 +10,10 @@ from bilm.neuromod import Neuromod
 from bilm.homeostasis import Homeostasis
 from bilm.hippocampus import Hippocampus
 from bilm.generator import Generator
-from bilm.readout import LocalByteReadout
+from bilm.deep_readout import DeepAssociativeReadout
+from bilm.dap import DenseAssociativeProjection
+from bilm.fales import FeedbackAlignment
+from bilm.srs import SparseRecurrentState
 from bilm.config import CHECKPOINT_DIR
 from bilm.metrics import target_loss_bits, bits_per_byte, byte_perplexity
 from bilm.results import Prediction, ObservationResult, EvaluationReport
@@ -35,7 +38,11 @@ class BILM:
         self.homeostasis = Homeostasis(self.cfg)
         self.hippocampus = Hippocampus(self.cfg)
         self.generator   = Generator(self.cfg, self.codec)
-        self.readout     = LocalByteReadout(self.cfg)
+        self.readout     = DeepAssociativeReadout(self.cfg)
+        self.dap         = DenseAssociativeProjection(self.cfg)
+        self.feedback    = FeedbackAlignment(self.cfg)
+        self.srs         = SparseRecurrentState(self.cfg)
+        self._lookahead: list[tuple[np.ndarray, np.ndarray]] = []
         self.tokens_seen: int = 0
 
     # ------------------------------------------------------------------
@@ -45,7 +52,19 @@ class BILM:
     def predict_next(self, temperature: float = 1.0) -> Prediction:
         """Return the next-byte distribution implied by the current context."""
         columns = self.cortex.get_predictive_columns().astype(np.int64, copy=True)
-        probabilities = self.readout.predict(columns, self.codec, temperature)
+        srs_bias = self.srs.step(columns)
+
+        ctx       = self.cortex.get_layer_sdr(self.cfg.n_layers - 1)
+        retrieved = self.hippocampus.retrieve(ctx)
+
+        if retrieved.size > 0:
+            alpha   = self.cfg.hippo_readout_alpha
+            p_fresh = self.readout.predict(columns, self.codec, temperature=temperature, logit_bias=srs_bias)
+            p_hippo = self.readout.predict(retrieved.astype(np.int64), self.codec, temperature=temperature, logit_bias=srs_bias)
+            probabilities = (1 - alpha) * p_fresh + alpha * p_hippo
+        else:
+            probabilities = self.readout.predict(columns, self.codec, temperature=temperature, logit_bias=srs_bias)
+
         argmax = int(np.argmax(probabilities))
         return Prediction(
             probabilities=probabilities,
@@ -66,20 +85,39 @@ class BILM:
             )
 
         sdr_cols = self.codec.encode(target, track=learn)
+
+        # DAP projection passed as apical bias to Layer 0
+        dap_dense = self.dap.project(sdr_cols)
+        dap_bias = dap_dense @ self.dap.W.T
+        self.cortex.layers[0].apply_apical_bias(dap_bias)
+
         hab_scale = self.codec.habituation_scale(target)
         lr = self.neuromod.lr_scale(hab_scale) if learn else 0.0
         surprise = self.cortex.step(sdr_cols, learn=learn, learn_rate_override=lr)
+
+        # Step SRS with target sdr_cols to keep state in sync
+        self.srs.step(sdr_cols)
 
         if learn:
             self.neuromod.update(surprise)
             self.homeostasis.maybe_apply(self.cortex)
 
             cortical_context = self.cortex.get_layer_sdr(self.cfg.n_layers - 1)
-            bound = self.hippocampus.maybe_bind(cortical_context, surprise)
-            if not bound and surprise > 0.3:
-                retrieved = self.hippocampus.retrieve(cortical_context)
-                if retrieved.size > 0:
-                    self.hippocampus.apply_to_cortex(retrieved, self.cortex)
+            self.hippocampus.maybe_bind(cortical_context, surprise)
+
+            # FALES 3-step lookahead
+            self._lookahead.append((prior.predictive_columns.copy(), prior.probabilities.copy()))
+            if len(self._lookahead) > self.cfg.lookahead_steps + 1:
+                self._lookahead.pop(0)
+            if len(self._lookahead) >= self.cfg.lookahead_steps:
+                old_cols, old_probs = self._lookahead[0]
+                delayed_err = np.zeros(256, np.float32)
+                delayed_err[target] = 1.0
+                delayed_err -= old_probs
+                dlr = lr * self.cfg.lookahead_lr_scale
+                for i, layer in enumerate(self.cortex.layers):
+                    self.feedback.apply(layer, i, delayed_err, dlr)
+
             self.tokens_seen += 1
 
         return ObservationResult(
@@ -145,6 +183,8 @@ class BILM:
                 "weights": self.readout.weights.copy(),
                 "bias": self.readout.bias.copy(),
             },
+            "srs_state": self.srs.state.copy(),
+            "lookahead": [(cols.copy(), probs.copy()) for cols, probs in self._lookahead],
             "neuromod_surprise": list(self.neuromod._surprise_history),
             "neuromod_variance": list(self.neuromod._variance_window),
             "neuromod_ach": self.neuromod.ach,
@@ -169,6 +209,8 @@ class BILM:
         else:
             self.readout.weights[:] = state["readout_state"]["weights"]
             self.readout.bias[:] = state["readout_state"]["bias"]
+        self.srs.state[:] = state["srs_state"]
+        self._lookahead = [(cols.copy(), probs.copy()) for cols, probs in state["lookahead"]]
         self.neuromod._surprise_history.clear()
         self.neuromod._surprise_history.extend(state["neuromod_surprise"])
         self.neuromod._variance_window.clear()
@@ -267,9 +309,22 @@ class BILM:
         arrays["hippo_targets"] = self.hippocampus.targets
         arrays["hippo_weights"] = self.hippocampus.weights
         arrays["hippo_counts"] = self.hippocampus.counts
-        arrays["readout_weights"] = self.readout.weights
-        arrays["readout_bias"] = self.readout.bias
-        arrays["readout_updates"] = np.array([self.readout.updates], dtype=np.int64)
+        if hasattr(self.readout, "save_state"):
+            for k, v in self.readout.save_state().items():
+                arrays[k] = v
+        else:
+            arrays["readout_weights"] = self.readout.weights
+            arrays["readout_bias"] = self.readout.bias
+            arrays["readout_updates"] = np.array([self.readout.updates], dtype=np.int64)
+        if hasattr(self, "dap"):
+            arrays["dap_W"] = self.dap.W
+        if hasattr(self, "srs"):
+            arrays["srs_W_k"] = self.srs.W_k
+            arrays["srs_W_v"] = self.srs.W_v
+            arrays["srs_W_q"] = self.srs.W_q
+            arrays["srs_W_proj"] = self.srs.W_proj
+            arrays["srs_decay"] = self.srs.decay
+            arrays["srs_state"] = self.srs.state
 
         # Codec frequencies
         arrays["codec_frequencies"] = self.codec.frequencies
@@ -325,10 +380,22 @@ class BILM:
             self.hippocampus.targets[:] = data["hippo_targets"]
             self.hippocampus.weights[:] = data["hippo_weights"]
             self.hippocampus.counts[:] = data["hippo_counts"]
-        if "readout_weights" in data:
+        if hasattr(self.readout, "load_state") and "dar_W_embed" in data:
+            state = {k: data[k] for k in data.files if k.startswith("dar_")}
+            self.readout.load_state(state)
+        elif "readout_weights" in data and hasattr(self.readout, "weights"):
             self.readout.weights[:] = data["readout_weights"]
             self.readout.bias[:] = data["readout_bias"]
             self.readout.updates = int(data["readout_updates"][0])
+        if "dap_W" in data and hasattr(self, "dap"):
+            self.dap.W[:] = data["dap_W"]
+        if "srs_state" in data and hasattr(self, "srs"):
+            self.srs.W_k[:] = data["srs_W_k"]
+            self.srs.W_v[:] = data["srs_W_v"]
+            self.srs.W_q[:] = data["srs_W_q"]
+            self.srs.W_proj[:] = data["srs_W_proj"]
+            self.srs.decay[:] = data["srs_decay"]
+            self.srs.state[:] = data["srs_state"]
         self.codec.frequencies[:] = data["codec_frequencies"]
         self.tokens_seen = int(data["tokens_seen"][0])
         if "codec_total_seen" in data:
