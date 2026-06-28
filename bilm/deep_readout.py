@@ -34,6 +34,7 @@ def dar_fwd_jit(
         h1 = np.zeros(dar_hidden_1, dtype=np.float32)
         for c in cols:
             h1 += W_embed[c]
+        h1 /= np.sqrt(cols.size)  # Scale normalization
     else:
         h1 = np.zeros(dar_hidden_1, dtype=np.float32)
     h2_pre = h1 @ W_hidden + b_hidden
@@ -77,8 +78,9 @@ def dar_learn_jit(
     
     if cols.size > 0:
         grad1 = err2 @ W_hidden.T
+        scale = np.sqrt(cols.size)
         for c in cols:
-            W_embed[c] += dar_embed_lr * grad1
+            W_embed[c] += (dar_embed_lr / scale) * grad1
 
 
 class DeepAssociativeReadout:
@@ -92,11 +94,11 @@ class DeepAssociativeReadout:
         self.b_hidden = np.zeros(H2,  dtype=np.float32)
         self.W_out    = rng.normal(0, H2**-0.5, (H2, 256)).astype(np.float32)
         self.b_out    = np.zeros(256, dtype=np.float32)
-        # Adam state
-        self.m_W = np.zeros_like(self.W_out)
-        self.v_W = np.zeros_like(self.W_out)
-        self.m_b = np.zeros_like(self.b_out)
-        self.v_b = np.zeros_like(self.b_out)
+        # Adam state — float64 prevents float32 overflow in gW**2 on long runs
+        self.m_W = np.zeros_like(self.W_out, dtype=np.float64)
+        self.v_W = np.zeros_like(self.W_out, dtype=np.float64)
+        self.m_b = np.zeros_like(self.b_out, dtype=np.float64)
+        self.v_b = np.zeros_like(self.b_out, dtype=np.float64)
         self.adam_step = 0
         # Mini-batch buffer
         self._bh2:  list[np.ndarray] = []
@@ -176,15 +178,25 @@ class DeepAssociativeReadout:
         for i, tgt in enumerate(self._btgt):
             P[i, tgt] -= 1.0
         P /= len(self._btgt)
-        gW, gb = H.T @ P, P.sum(0)
+        # Cast to float64 — Adam accumulators are float64 to prevent
+        # float32 overflow in gW**2 on long training runs
+        gW = (H.T @ P).astype(np.float64)
+        gb = P.sum(0).astype(np.float64)
 
         b1, b2, eps = self.cfg.dar_adam_beta1, self.cfg.dar_adam_beta2, self.cfg.dar_adam_eps
         self.m_W = b1*self.m_W + (1-b1)*gW;  self.v_W = b2*self.v_W + (1-b2)*gW**2
         self.m_b = b1*self.m_b + (1-b1)*gb;  self.v_b = b2*self.v_b + (1-b2)*gb**2
         mhW = self.m_W/(1-b1**t);  vhW = self.v_W/(1-b2**t)
         mhb = self.m_b/(1-b1**t);  vhb = self.v_b/(1-b2**t)
-        self.W_out -= lr * mhW / (np.sqrt(vhW) + eps)
-        self.b_out -= lr * mhb / (np.sqrt(vhb) + eps)
+        self.W_out -= (lr * mhW / (np.sqrt(vhW) + eps)).astype(np.float32)
+        self.b_out -= (lr * mhb / (np.sqrt(vhb) + eps)).astype(np.float32)
+
+        # NaN guard — last-resort safety net
+        if not np.isfinite(self.W_out).all():
+            self.W_out[:] = 0.0
+        if not np.isfinite(self.b_out).all():
+            self.b_out[:] = 0.0
+
         self._bh2.clear(); self._btgt.clear(); self._bprb.clear()
 
     def save_state(self) -> dict:

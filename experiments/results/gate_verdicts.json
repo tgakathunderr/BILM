@@ -1,0 +1,10 @@
+{
+  "bpb_at_100k": 4.2216,
+  "gates": {
+    "phase_2_dar": "PASS",
+    "phase_3_dap": "PASS",
+    "phase_4_fales": "PASS",
+    "phase_5_srs": "PASS"
+  },
+  "all_pass": true
+}
