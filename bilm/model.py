@@ -60,7 +60,8 @@ class BILM:
         if retrieved.size > 0:
             alpha   = self.cfg.hippo_readout_alpha
             p_fresh = self.readout.predict(columns, self.codec, temperature=temperature, logit_bias=srs_bias)
-            p_hippo = self.readout.predict(retrieved.astype(np.int64), self.codec, temperature=temperature, logit_bias=srs_bias)
+            hippo_cols = self.hippocampus.cortical_columns_for(retrieved)
+            p_hippo = self.readout.predict(hippo_cols, self.codec, temperature=temperature, logit_bias=srs_bias)
             probabilities = (1 - alpha) * p_fresh + alpha * p_hippo
         else:
             probabilities = self.readout.predict(columns, self.codec, temperature=temperature, logit_bias=srs_bias)

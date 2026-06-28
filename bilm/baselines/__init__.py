@@ -6,6 +6,11 @@ import numpy as np
 from bilm.metrics import target_loss_bits, bits_per_byte, byte_perplexity
 from bilm.results import EvaluationReport
 
+# Re-export new PyTorch baselines
+from bilm.baselines.tiny_transformer import TinyTransformer
+from bilm.baselines.lstm_lm import LSTM_LM
+from bilm.baselines.minimal_ssm import MinimalSSM
+
 
 class UnigramByteLM:
     """Unigram byte baseline with additive smoothing."""
@@ -107,3 +112,12 @@ class NGramByteLM:
             perplexity=byte_perplexity(bpb),
             accuracy=(correct / len(losses)) if losses else 0.0,
         )
+
+
+__all__ = [
+    "UnigramByteLM",
+    "NGramByteLM",
+    "TinyTransformer",
+    "LSTM_LM",
+    "MinimalSSM",
+]
