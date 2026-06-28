@@ -1,16 +1,15 @@
 """
-Deep Associative Readout (DAR) — drop-in replacement for LocalByteReadout.
+Deep Associative Readout (DAR) — 3-layer neural network readout mapping active
+cortical column projections to calibrated next-byte probability distributions.
 
 Architecture:
-  L1: active SDR columns -> sum of embedding rows -> h1  (dar_hidden_1,)
+  L1: Active SDR columns -> sum of embedding rows -> h1  (dar_hidden_1,)
   L2: h1 -> Linear -> ReLU -> h2                        (dar_hidden_2,)
   L3: h2 -> Linear -> logits                            (256,)
 
 Learning:
   L1, L2: Online local delta rule, one token at a time
-  L3:     Mini-batch Adam with decaying lr (CL-safe)
-
-API is identical to LocalByteReadout: predict() and learn().
+  L3:     Mini-batch Adam with learning rate decay to prevent forgetting
 """
 import numba
 import numpy as np

@@ -202,22 +202,6 @@ class Hippocampus:
         hashed = (hashed % self.cfg.hippo_size).astype(np.int32)
         return np.where(np.isin(hashed, retrieved))[0][:self.cfg.sdr_sparsity].astype(np.int64)
 
-    def apply_to_cortex(self, retrieved: np.ndarray, hierarchy, gain: float = 0.2) -> None:
-        import warnings
-        warnings.warn(
-            "apply_to_cortex is deprecated and will be replaced in Phase 6.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if retrieved.size == 0:
-            return
-        candidates = self.cortical_columns_for(retrieved)
-        if candidates.size == 0:
-            return
-        bias = np.zeros(self.cfg.sdr_size, dtype=np.float32)
-        bias[candidates] = float(gain)
-        hierarchy.layers[0].apply_apical_bias(bias)
-
     def get_stats(self) -> dict:
         return {
             "binds": self.binds,
